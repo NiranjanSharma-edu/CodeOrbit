@@ -54,6 +54,20 @@ type AiMessage = {
 };
 type Repo = { full_name: string; default_branch: string; private: boolean; updated_at?: string; name?: string };
 
+type ExecutionResult = {
+  stdout: string;
+  stderr: string;
+  compile_output: string;
+  status: { id: number; description: string } | null;
+  time: string | null;
+  memory: number | null;
+  is_success: boolean;
+  is_compile_error: boolean;
+  is_runtime_error: boolean;
+  is_tle: boolean;
+  error?: string;
+} | null;
+
 type TreeEntry = {
   path: string;
   type: "blob" | "tree";
@@ -72,7 +86,8 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
   const supabase = useMemo(() => createClient(), []);
   const [code, setCode] = useState(room.code ?? languageByMonaco(room.language).starter);
   const [language, setLanguage] = useState(room.language);
-  const [output, setOutput] = useState("Ready.");
+  const [execResult, setExecResult] = useState<ExecutionResult>(null);
+  const [outputTab, setOutputTab] = useState<"stdout" | "stderr" | "compile" | "info">("stdout");
   const [stdin, setStdin] = useState("");
   const [activeUsers, setActiveUsers] = useState<PresenceUser[]>([]);
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([
@@ -106,6 +121,7 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
   const channelName = useMemo(() => `room:${room.id}`, [room.id]);
   const selectedLanguage = languageByMonaco(language);
   const currentCode = useRef(code);
+  const isFetchingRepos = useRef(false);
   const { toast } = useToast();
 
   useEffect(() => {
@@ -286,22 +302,28 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
 
   async function runCode() {
     setRunLoading(true);
-    setOutput("Running...");
+    setExecResult(null);
+    setOutputTab("stdout");
     try {
       const response = await fetch("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ language, code, stdin })
       });
-      const result = await response.json();
+      const result = await response.json() as ExecutionResult & { error?: string };
       if (!response.ok) {
-        throw new Error(result.error ?? "Judge0 request failed.");
+        throw new Error(result?.error ?? "Execution failed.");
       }
-      setOutput([result.status?.description, result.stdout, result.stderr, result.compile_output].filter(Boolean).join("\n") || "No output.");
+      setExecResult(result);
+      // Auto-switch tab to most relevant output
+      if (result?.is_compile_error) setOutputTab("compile");
+      else if (result?.stderr && !result?.stdout) setOutputTab("stderr");
+      else setOutputTab("stdout");
     } catch (error) {
       console.error("[CodeOrbit] Run failed", error);
       const message = error instanceof Error ? error.message : "Run failed.";
-      setOutput(message);
+      setExecResult({ stdout: "", stderr: "", compile_output: "", status: null, time: null, memory: null,
+        is_success: false, is_compile_error: false, is_runtime_error: false, is_tle: false, error: message });
       toast({ title: "Run failed", description: message, variant: "error" });
     } finally {
       setRunLoading(false);
@@ -312,12 +334,10 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
     const { error } = await supabase.from("code_snapshots").insert({ room_id: room.id, code });
     if (error) {
       console.error("[CodeOrbit] Snapshot failed", error);
-      setOutput(error.message);
       toast({ title: "Snapshot failed", description: error.message, variant: "error" });
       return;
     }
     lastSavedCode.current = code;
-    setOutput("Snapshot saved.");
     toast({ title: "Snapshot saved", description: "Code snapshot stored.", variant: "success" });
   }
 
@@ -337,7 +357,8 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
   }
 
   const loadRepos = useCallback(async () => {
-    if (repoLoading) return;
+    if (isFetchingRepos.current) return;
+    isFetchingRepos.current = true;
     setRepoLoading(true);
     setRepoError(null);
     try {
@@ -355,7 +376,7 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
         return;
       }
 
-      const response = await fetch("https://api.github.com/user/repos", {
+      const response = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated", {
         headers: {
           Authorization: `Bearer ${token}`
         }
@@ -381,9 +402,10 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
         variant: "error"
       });
     } finally {
+      isFetchingRepos.current = false;
       setRepoLoading(false);
     }
-  }, [repoLoading, supabase, toast]);
+  }, [supabase, toast]);
 
   const loadRepoTree = useCallback(async (nextRepo: string) => {
     if (!nextRepo) return;
@@ -429,10 +451,9 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
       setCode(data.content ?? "");
       setFileSha(data.sha);
       setActiveFilePath(path);
-      setOutput(`Opened ${selectedRepo}/${path}`);
+      toast({ title: "File opened", description: `${selectedRepo}/${path}`, variant: "success" });
     } catch (error) {
       console.error("[CodeOrbit] Open file failed", error);
-      setOutput(error instanceof Error ? error.message : "Could not open file.");
       toast({
         title: "Open file failed",
         description: error instanceof Error ? error.message : "Could not open file.",
@@ -461,11 +482,9 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
     const data = await response.json();
     if (!response.ok) {
       const message = data.error ?? "Commit failed.";
-      setOutput(message);
       toast({ title: "Commit failed", description: message, variant: "error" });
       return;
     }
-    setOutput(data.commit?.html_url ?? "Commit finished.");
     toast({ title: "Commit created", description: data.commit?.html_url ?? "Changes pushed.", variant: "success" });
   }
 
@@ -578,16 +597,37 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
           <div className="flex items-center gap-1 rounded-full border border-slate-700/70 bg-slate-950/50 px-3 py-2 text-sm text-slate-300">
             <Users className="h-4 w-4 text-cyan-300" /> {activeUsers.length}
           </div>
-          <select value={language} onChange={(event) => setLanguage(event.target.value)} className="h-10 rounded-full border border-slate-700/70 bg-slate-950/60 px-4 text-sm text-slate-100 outline-none transition-all focus:border-blue-400/70">
-            {languages.map((item) => <option key={item.monaco} value={item.monaco}>{item.label}</option>)}
-          </select>
+          <div className="relative flex items-center">
+            <span
+              className="lang-dot pointer-events-none absolute left-3 z-10"
+              style={{ background: selectedLanguage.color, color: selectedLanguage.color }}
+            />
+            <select
+              value={language}
+              onChange={(event) => {
+                setLanguage(event.target.value);
+                setExecResult(null);
+              }}
+              className="h-10 rounded-full border border-slate-700/70 bg-slate-950/60 pl-8 pr-4 text-sm text-slate-100 outline-none transition-all focus:border-blue-400/70"
+            >
+              {languages.map((item) => <option key={item.monaco} value={item.monaco}>{item.label}</option>)}
+            </select>
+          </div>
           <Button variant="outline" size="sm" className="rounded-full px-3"><Bell className="h-4 w-4" /></Button>
           <Button size="sm" variant="outline" onClick={copyRoomLink}>
             <Copy className="mr-2 h-4 w-4" /> Copy link
           </Button>
-          <Button size="sm" onClick={runCode} disabled={runLoading}>
-            <Play className="mr-2 h-4 w-4" />
-            {runLoading ? "Running..." : "Run"}
+          <Button
+            size="sm"
+            onClick={runCode}
+            disabled={runLoading}
+            className="min-w-[100px]"
+          >
+            {runLoading ? (
+              <><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Running...</>
+            ) : (
+              <><Play className="mr-2 h-4 w-4" /> Run {selectedLanguage.label}</>
+            )}
           </Button>
         </div>
       </header>
@@ -718,7 +758,13 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
               <span className="h-3 w-3 rounded-full bg-rose-400" />
               <span className="h-3 w-3 rounded-full bg-amber-300" />
               <span className="h-3 w-3 rounded-full bg-emerald-400" />
-              <span className="ml-3 rounded-full bg-blue-500/10 px-3 py-1 text-xs text-blue-200">{selectedLanguage.label}</span>
+              <span className="ml-3 flex items-center gap-2 rounded-full bg-blue-500/10 px-3 py-1 text-xs text-blue-200">
+                <span
+                  className="lang-dot"
+                  style={{ background: selectedLanguage.color, color: selectedLanguage.color }}
+                />
+                {selectedLanguage.label}{selectedLanguage.compiled ? " (compiled)" : ""}
+              </span>
             </div>
             <p className="text-xs uppercase tracking-[0.2em] text-slate-500">autosave enabled</p>
           </div>
@@ -734,11 +780,114 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
         </motion.div>
         <aside className="ml-3 hidden min-h-[calc(100vh-6rem)] flex-col gap-3 lg:flex">
           <div className="glass-panel rounded-lg p-4">
-            <div className="mb-3 flex gap-2">
+            {/* Controls row */}
+            <div className="mb-3 flex items-center gap-2">
               <Button size="sm" variant="outline" onClick={saveSnapshot}><Save className="mr-2 h-4 w-4" /> Snapshot</Button>
+              {/* Execution status badge */}
+              {runLoading ? (
+                <span className="exec-status exec-status-running terminal-cursor">Running</span>
+              ) : execResult ? (
+                <span className={`exec-status ${
+                  execResult.error ? "exec-status-error" :
+                  execResult.is_compile_error ? "exec-status-compile" :
+                  execResult.is_tle ? "exec-status-tle" :
+                  execResult.is_runtime_error ? "exec-status-error" :
+                  execResult.is_success ? "exec-status-accepted" :
+                  "exec-status-error"
+                }`}>
+                  {execResult.error ? "Error" : execResult.status?.description ?? "Done"}
+                </span>
+              ) : (
+                <span className="exec-status exec-status-idle">Ready</span>
+              )}
+              {/* Execution metadata */}
+              {execResult?.time && !execResult.error ? (
+                <span className="ml-auto text-[10px] text-slate-500">
+                  {execResult.time}s · {execResult.memory ? `${Math.round(execResult.memory / 1024)}KB` : ""}
+                </span>
+              ) : null}
             </div>
-            <Input value={stdin} onChange={(event) => setStdin(event.target.value)} placeholder="stdin" />
-            <pre className="mt-3 max-h-48 overflow-auto rounded-md border border-slate-800 bg-black/40 p-3 text-xs leading-6 text-slate-300">{output}</pre>
+
+            {/* stdin */}
+            <Input
+              value={stdin}
+              onChange={(event) => setStdin(event.target.value)}
+              placeholder="stdin (optional)"
+              className="mb-2"
+            />
+
+            {/* Output tabs */}
+            <div className="relative mb-1 flex items-center gap-0.5 border-b border-slate-800/60">
+              {([
+                { key: "stdout", label: "Output", dot: execResult?.stdout ? "bg-emerald-400" : null },
+                { key: "stderr", label: "Stderr", dot: execResult?.stderr ? "bg-rose-400" : null },
+                { key: "compile", label: "Compile", dot: execResult?.compile_output ? "bg-orange-400" : null },
+                { key: "info", label: "Info", dot: null },
+              ] as const).map(({ key, label, dot }) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setOutputTab(key)}
+                  className={`output-tab ${outputTab === key ? "output-tab-active" : "text-slate-500"}`}
+                >
+                  {label}
+                  {dot ? <span className={`ml-1 inline-block h-1.5 w-1.5 rounded-full ${dot}`} /> : null}
+                </button>
+              ))}
+            </div>
+
+            {/* Terminal panel */}
+            <div className="terminal-panel mt-1 min-h-[96px] max-h-52">
+              {runLoading ? (
+                <span className="text-cyan-300/60 terminal-cursor">Executing {selectedLanguage.label} code</span>
+              ) : !execResult ? (
+                <span className="text-slate-600">Run your code to see output here.</span>
+              ) : outputTab === "stdout" ? (
+                execResult.error ? (
+                  <span className="text-rose-300">{execResult.error}</span>
+                ) : execResult.stdout ? (
+                  <span className="text-emerald-200">{execResult.stdout}</span>
+                ) : (
+                  <span className="text-slate-600">No stdout output.</span>
+                )
+              ) : outputTab === "stderr" ? (
+                execResult.stderr ? (
+                  <span className="text-rose-300">{execResult.stderr}</span>
+                ) : (
+                  <span className="text-slate-600">No stderr output.</span>
+                )
+              ) : outputTab === "compile" ? (
+                execResult.compile_output ? (
+                  <span className="text-orange-300">{execResult.compile_output}</span>
+                ) : (
+                  <span className="text-slate-600">No compilation output.</span>
+                )
+              ) : (
+                /* Info tab */
+                <div className="space-y-1.5 text-[11px]">
+                  <div className="flex gap-2">
+                    <span className="text-slate-500 w-20 shrink-0">Language</span>
+                    <span className="text-slate-300">{selectedLanguage.label}{selectedLanguage.compiled ? " (compiled)" : " (interpreted)"}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <span className="text-slate-500 w-20 shrink-0">Status</span>
+                    <span className="text-slate-300">{execResult.status?.description ?? (execResult.error ? "Error" : "—")}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <span className="text-slate-500 w-20 shrink-0">Exec time</span>
+                    <span className="text-slate-300">{execResult.time ? `${execResult.time}s` : "—"}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <span className="text-slate-500 w-20 shrink-0">Memory</span>
+                    <span className="text-slate-300">{execResult.memory ? `${Math.round(execResult.memory / 1024)} KB` : "—"}</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <span className="text-slate-500 w-20 shrink-0">Exit code</span>
+                    <span className="text-slate-300">{execResult.is_success ? "0" : (execResult.error ? "—" : "non-zero")}</span>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
           <div className="glass-panel rounded-lg p-4">
             <h2 className="mb-3 text-sm font-bold uppercase tracking-[0.22em] text-slate-400">Active crew</h2>

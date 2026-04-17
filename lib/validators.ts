@@ -1,12 +1,20 @@
 import { z } from "zod";
+import { VALID_MONACO_IDS } from "@/lib/languages";
 
 export const roomIdSchema = z.string().uuid();
 
 export const runCodeSchema = z.object({
-  language: z.string().min(1).max(40),
-  code: z.string().min(1).max(100_000),
-  stdin: z.string().max(20_000).optional().default("")
+  /** Must be a valid Monaco language ID registered in lib/languages.ts */
+  language: z.enum(VALID_MONACO_IDS, {
+    errorMap: () => ({ message: "Unsupported language." }),
+  }),
+  /** Source code — max 100 KB */
+  code: z.string().min(1, "Code cannot be empty.").max(100_000, "Code exceeds 100 KB limit."),
+  /** Standard input — max 20 KB */
+  stdin: z.string().max(20_000, "stdin exceeds 20 KB limit.").optional().default(""),
 });
+
+export type RunCodeInput = z.infer<typeof runCodeSchema>;
 
 export const githubFileSchema = z.object({
   owner: z.string().min(1),
