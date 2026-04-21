@@ -15,12 +15,20 @@ export function AuthPanel() {
   const [name, setName] = useState("");
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [message, setMessage] = useState("");
-  const redirectTo = "http://localhost:3000";
+
 
   async function signInWithGithub() {
+    // redirectTo MUST point at /auth/callback so that
+    // supabase.auth.exchangeCodeForSession(code) is called, which stores
+    // provider_token (GitHub access token) in the session cookie.
+    const redirectTo = `${window.location.origin}/auth/callback`;
+
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "github",
-      options: { redirectTo, scopes: "repo read:user" }
+      options: {
+        redirectTo,
+        scopes: "repo read:user user:email"
+      }
     });
 
     if (error) {
@@ -37,7 +45,7 @@ export function AuthPanel() {
         : await supabase.auth.signUp({
             email,
             password,
-            options: { data: { name }, emailRedirectTo: redirectTo }
+            options: { data: { name }, emailRedirectTo: `${window.location.origin}/auth/callback` }
           });
 
     if (response.error) {

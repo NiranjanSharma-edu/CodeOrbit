@@ -38,6 +38,7 @@ type Room = {
   language: string;
   code?: string;
   created_at: string;
+  created_by?: string | null;
 };
 
 type User = {
@@ -200,7 +201,19 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
     channel
       .on("presence", { event: "sync" }, () => {
         const state = channel.presenceState<PresenceUser>();
-        setActiveUsers(Object.values(state).flat());
+        // presenceState returns { [key: string]: PresenceUser[] }
+        // Each key corresponds to one user (user.id is the presence key).
+        // We take the LAST entry per key to get the most recent track() call,
+        // then deduplicate by user.id to guarantee no duplicate React keys.
+        const seen = new Map<string, PresenceUser>();
+        for (const presences of Object.values(state)) {
+          // presences is an array – take the last (most recent) presence for this key
+          const latest = presences[presences.length - 1];
+          if (latest?.id && !seen.has(latest.id)) {
+            seen.set(latest.id, latest);
+          }
+        }
+        setActiveUsers(Array.from(seen.values()));
       })
       .on("broadcast", { event: "code-change" }, ({ payload }) => {
         if (payload.userId !== user.id && typeof payload.code === "string") {
@@ -228,6 +241,26 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
             ...user,
             color: cursorColors[Math.abs(hashCode(user.id)) % cursorColors.length]
           });
+
+          // Use the server-side join route so that:
+          //  1. The profile row is upserted FIRST (satisfies FK room_members.user_id → profiles.id)
+          //  2. Then room_members is upserted
+          //  3. Both ops run with the auth session, bypassing potential anon-key RLS edge-cases
+          try {
+            const res = await fetch("/api/room/join", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ room_id: room.id })
+            });
+            const data = await res.json() as { ok?: boolean; role?: string; error?: string };
+            if (!res.ok) {
+              console.error("[CodeOrbit] joinRoom failed:", data.error ?? res.statusText);
+            } else {
+              console.info(`[CodeOrbit] Joined room ${room.id} as ${data.role}`);
+            }
+          } catch (err) {
+            console.error("[CodeOrbit] joinRoom fetch error:", err);
+          }
         }
       });
 
@@ -362,36 +395,25 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
     setRepoLoading(true);
     setRepoError(null);
     try {
-      const {
-        data: { session }
-      } = await supabase.auth.getSession();
-      console.log("SESSION:", session);
-      const token = session?.provider_token;
-      console.log("TOKEN:", token);
+      // Call the server-side route — it reads provider_token from the session
+      // cookie and calls GitHub on the server. The access token is never
+      // exposed to the browser.
+      const response = await fetch("/api/github/repos");
 
-      if (!token) {
-        console.error("GitHub token missing");
+      if (response.status === 401) {
+        // Token missing or expired — prompt re-auth
         setRepos([]);
-        setRepoError("GitHub token missing. Please re-authenticate.");
+        setRepoError("GitHub access expired. Sign in again with GitHub to reload.");
         return;
       }
 
-      const response = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated", {
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
-      });
+      const data = await response.json() as { repos?: Repo[]; error?: string };
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error("GitHub API error", errorText);
-        setRepoError("Could not load repositories.");
-        return;
+        throw new Error(data.error ?? "Could not load repositories.");
       }
 
-      const data = await response.json();
-      console.log("REPOS:", data);
-      setRepos(Array.isArray(data) ? data : []);
+      setRepos(Array.isArray(data.repos) ? data.repos : []);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not load repositories.";
       console.error("[CodeOrbit] Repo load failed", error);
@@ -405,7 +427,8 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
       isFetchingRepos.current = false;
       setRepoLoading(false);
     }
-  }, [supabase, toast]);
+  }, [toast]);
+
 
   const loadRepoTree = useCallback(async (nextRepo: string) => {
     if (!nextRepo) return;
@@ -892,10 +915,25 @@ export function RoomClient({ room, user }: { room: Room; user: User }) {
           <div className="glass-panel rounded-lg p-4">
             <h2 className="mb-3 text-sm font-bold uppercase tracking-[0.22em] text-slate-400">Active crew</h2>
             <div className="space-y-2">
-              {activeUsers.map((active) => (
-                <div key={active.id} className="flex items-center gap-3 rounded-md bg-slate-950/40 px-3 py-2 text-sm">
-                  <span className="h-2.5 w-2.5 rounded-full shadow-[0_0_16px_currentColor]" style={{ background: active.color, color: active.color }} />
-                  <span className="truncate">{active.name}</span>
+              {/* Deduplicate by id as a safety net before render */}
+              {Array.from(
+                new Map(activeUsers.map((u) => [u.id, u])).values()
+              ).map((active) => (
+                <div
+                  key={active.id}
+                  className="flex items-center gap-3 rounded-md bg-slate-950/40 px-3 py-2 text-sm"
+                >
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-full shadow-[0_0_16px_currentColor]"
+                    style={{ background: active.color, color: active.color }}
+                  />
+                  <span className="truncate flex-1">{active.name}</span>
+                  {active.id === user.id && (
+                    <span className="shrink-0 rounded-full border border-indigo-400/40 bg-indigo-500/10
+                      px-2 py-0.5 text-[10px] uppercase tracking-[0.15em] text-indigo-300">
+                      You
+                    </span>
+                  )}
                 </div>
               ))}
               {activeUsers.length === 0 ? <div className="shimmer h-10 rounded-md bg-slate-900/70" /> : null}

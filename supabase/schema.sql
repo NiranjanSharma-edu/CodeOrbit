@@ -147,3 +147,118 @@ begin
 exception
   when duplicate_object then null;
 end $$;
+
+-- ===========================================================================
+-- PROFILES  (one row per auth.users, auto-created by trigger)
+-- ===========================================================================
+create table if not exists public.profiles (
+  id         uuid primary key references auth.users(id) on delete cascade,
+  name       text,
+  avatar_url text,
+  updated_at timestamptz default now()
+);
+
+alter table public.profiles enable row level security;
+
+drop policy if exists "Profiles readable by authenticated" on public.profiles;
+create policy "Profiles readable by authenticated"
+  on public.profiles for select to authenticated using (true);
+
+drop policy if exists "Users can upsert own profile" on public.profiles;
+create policy "Users can upsert own profile"
+  on public.profiles for all to authenticated
+  using (auth.uid() = id) with check (auth.uid() = id);
+
+-- Trigger: auto-create / refresh profile on auth.users INSERT
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles (id, name, avatar_url)
+  values (
+    new.id,
+    coalesce(
+      new.raw_user_meta_data->>'name',
+      new.raw_user_meta_data->>'full_name',
+      new.raw_user_meta_data->>'user_name',
+      new.email
+    ),
+    new.raw_user_meta_data->>'avatar_url'
+  )
+  on conflict (id) do update
+    set name       = excluded.name,
+        avatar_url = excluded.avatar_url,
+        updated_at = now();
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- Backfill profiles for any existing users (safe to re-run)
+insert into public.profiles (id, name, avatar_url)
+select
+  id,
+  coalesce(raw_user_meta_data->>'name', raw_user_meta_data->>'full_name', raw_user_meta_data->>'user_name', email),
+  raw_user_meta_data->>'avatar_url'
+from auth.users
+on conflict (id) do update
+  set name       = excluded.name,
+      avatar_url = excluded.avatar_url,
+      updated_at = now();
+
+-- ===========================================================================
+-- ROOMS  –  add created_by (nullable for backward-compat)
+-- ===========================================================================
+alter table public.rooms
+  add column if not exists created_by uuid references auth.users(id) on delete set null;
+
+-- ===========================================================================
+-- ROOM_MEMBERS
+-- ===========================================================================
+create table if not exists public.room_members (
+  id        uuid primary key default gen_random_uuid(),
+  room_id   uuid not null references public.rooms(id) on delete cascade,
+  user_id   uuid not null references public.profiles(id) on delete cascade,
+  role      text not null default 'viewer'
+            check (role in ('owner', 'editor', 'viewer')),
+  joined_at timestamptz not null default now(),
+  unique (room_id, user_id)
+);
+
+create index if not exists room_members_room_idx on public.room_members(room_id);
+create index if not exists room_members_user_idx on public.room_members(user_id);
+
+alter table public.room_members enable row level security;
+
+drop policy if exists "Room members readable by authenticated" on public.room_members;
+create policy "Room members readable by authenticated"
+  on public.room_members for select to authenticated using (true);
+
+drop policy if exists "Members can insert themselves" on public.room_members;
+create policy "Members can insert themselves"
+  on public.room_members for insert to authenticated
+  with check (auth.uid() = user_id);
+
+drop policy if exists "Members can update own role" on public.room_members;
+create policy "Members can update own role"
+  on public.room_members for update to authenticated
+  using (auth.uid() = user_id);
+
+drop policy if exists "Members can remove themselves" on public.room_members;
+create policy "Members can remove themselves"
+  on public.room_members for delete to authenticated
+  using (auth.uid() = user_id);
+
+-- Realtime for room_members + profiles
+do $$ begin
+  alter publication supabase_realtime add table public.room_members;
+exception when duplicate_object then null;
+end $$;
+
+do $$ begin
+  alter publication supabase_realtime add table public.profiles;
+exception when duplicate_object then null;
+end $$;
